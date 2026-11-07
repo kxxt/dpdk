@@ -5,6 +5,7 @@
  */
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <time.h>
 
 #include <pcap.h>
@@ -35,9 +36,11 @@
 #define ETH_PCAP_PHY_MAC_ARG  "phy_mac"
 #define ETH_PCAP_INFINITE_RX_ARG  "infinite_rx"
 
+#define ETH_PCAP_READ_BUFFER_SIZE (1024 * 1024)
+
 #define ETH_PCAP_ARG_MAXLEN	64
 
-#define RTE_PMD_PCAP_MAX_QUEUES 16
+#define RTE_PMD_PCAP_MAX_QUEUES 64
 
 static char errbuf[PCAP_ERRBUF_SIZE];
 static struct timespec start_time;
@@ -98,6 +101,7 @@ struct pmd_internals {
 
 struct pmd_process_private {
 	pcap_t *rx_pcap[RTE_PMD_PCAP_MAX_QUEUES];
+	char *rx_read_buffer[RTE_PMD_PCAP_MAX_QUEUES];
 	pcap_t *tx_pcap[RTE_PMD_PCAP_MAX_QUEUES];
 	pcap_dumper_t *tx_dumper[RTE_PMD_PCAP_MAX_QUEUES];
 };
@@ -107,6 +111,7 @@ struct pmd_devargs {
 	struct devargs_queue {
 		pcap_dumper_t *dumper;
 		pcap_t *pcap;
+		char *read_buffer;
 		const char *name;
 		const char *type;
 	} queue[RTE_PMD_PCAP_MAX_QUEUES];
@@ -573,21 +578,67 @@ open_single_tx_pcap(const char *pcap_filename, pcap_dumper_t **dumper)
 	return 0;
 }
 
-static int
-open_single_rx_pcap(const char *pcap_filename, pcap_t **pcap)
+/* The caller-owned stdio buffer must outlive the FILE owned by libpcap. */
+static void
+close_rx_pcap(pcap_t **pcap, char **read_buffer)
 {
-	*pcap = pcap_open_offline(pcap_filename, errbuf);
-	if (*pcap == NULL) {
-		PMD_LOG(ERR, "Couldn't open %s: %s", pcap_filename,
-			errbuf);
+	if (*pcap != NULL)
+		pcap_close(*pcap);
+	*pcap = NULL;
+	free(*read_buffer);
+	*read_buffer = NULL;
+}
+
+static int
+open_single_rx_pcap(const char *pcap_filename, pcap_t **pcap,
+		char **read_buffer)
+{
+	FILE *fp;
+	char *buffer;
+
+	*pcap = NULL;
+	*read_buffer = NULL;
+	/* Preserve libpcap's special handling of standard input. */
+	if (strcmp(pcap_filename, "-") == 0) {
+		*pcap = pcap_open_offline(pcap_filename, errbuf);
+		if (*pcap != NULL)
+			return 0;
+		PMD_LOG(ERR, "Couldn't open %s: %s", pcap_filename, errbuf);
 		return -1;
 	}
 
+	fp = fopen(pcap_filename, "rb");
+	if (fp == NULL) {
+		PMD_LOG(ERR, "Couldn't open %s", pcap_filename);
+		return -1;
+	}
+	buffer = malloc(ETH_PCAP_READ_BUFFER_SIZE);
+	if (buffer == NULL) {
+		PMD_LOG(ERR, "Couldn't allocate read buffer for %s", pcap_filename);
+		fclose(fp);
+		return -1;
+	}
+	/* Configure buffering before libpcap reads the capture header. */
+	if (setvbuf(fp, buffer, _IOFBF, ETH_PCAP_READ_BUFFER_SIZE) != 0) {
+		PMD_LOG(ERR, "Couldn't set read buffer for %s", pcap_filename);
+		fclose(fp);
+		free(buffer);
+		return -1;
+	}
+	*pcap = pcap_fopen_offline(fp, errbuf);
+	if (*pcap == NULL) {
+		PMD_LOG(ERR, "Couldn't open %s: %s", pcap_filename, errbuf);
+		fclose(fp);
+		free(buffer);
+		return -1;
+	}
+	*read_buffer = buffer;
 	return 0;
 }
 
 static uint64_t
-count_packets_in_pcap(pcap_t **pcap, struct pcap_rx_queue *pcap_q)
+count_packets_in_pcap(pcap_t **pcap, char **read_buffer,
+		struct pcap_rx_queue *pcap_q)
 {
 	const u_char *packet;
 	struct pcap_pkthdr header;
@@ -597,9 +648,8 @@ count_packets_in_pcap(pcap_t **pcap, struct pcap_rx_queue *pcap_q)
 		pcap_pkt_count++;
 
 	/* The pcap is reopened so it can be used as normal later. */
-	pcap_close(*pcap);
-	*pcap = NULL;
-	open_single_rx_pcap(pcap_q->name, pcap);
+	close_rx_pcap(pcap, read_buffer);
+	open_single_rx_pcap(pcap_q->name, pcap, read_buffer);
 
 	return pcap_pkt_count;
 }
@@ -652,7 +702,8 @@ eth_dev_start(struct rte_eth_dev *dev)
 			continue;
 
 		if (strcmp(rx->type, ETH_PCAP_RX_PCAP_ARG) == 0) {
-			if (open_single_rx_pcap(rx->name, &pp->rx_pcap[i]) < 0)
+			if (open_single_rx_pcap(rx->name, &pp->rx_pcap[i],
+					&pp->rx_read_buffer[i]) < 0)
 				return -1;
 		} else if (strcmp(rx->type, ETH_PCAP_RX_IFACE_ARG) == 0) {
 			if (open_single_iface(rx->name, &pp->rx_pcap[i]) < 0)
@@ -710,8 +761,7 @@ eth_dev_stop(struct rte_eth_dev *dev)
 	for (i = 0; i < dev->data->nb_rx_queues; i++) {
 		if (pp->rx_pcap[i] != NULL) {
 			queue_missed_stat_on_stop_update(dev, i);
-			pcap_close(pp->rx_pcap[i]);
-			pp->rx_pcap[i] = NULL;
+			close_rx_pcap(&pp->rx_pcap[i], &pp->rx_read_buffer[i]);
 		}
 	}
 
@@ -902,7 +952,10 @@ eth_rx_queue_setup(struct rte_eth_dev *dev,
 		if (unlikely(*pcap == NULL))
 			return -ENOENT;
 
-		pcap_pkt_count = count_packets_in_pcap(pcap, pcap_q);
+		pcap_pkt_count = count_packets_in_pcap(pcap,
+				&pp->rx_read_buffer[pcap_q->queue_id], pcap_q);
+		if (*pcap == NULL)
+			return -ENOENT;
 
 		snprintf(ring_name, sizeof(ring_name), "PCAP_RING%" PRIu32,
 				ring_number);
@@ -1040,14 +1093,16 @@ open_rx_pcap(const char *key, const char *value, void *extra_args)
 	const char *pcap_filename = value;
 	struct pmd_devargs *rx = extra_args;
 	pcap_t *pcap = NULL;
+	char *read_buffer = NULL;
 
-	if (open_single_rx_pcap(pcap_filename, &pcap) < 0)
+	if (open_single_rx_pcap(pcap_filename, &pcap, &read_buffer) < 0)
 		return -1;
 
 	if (add_queue(rx, pcap_filename, key, pcap, NULL) < 0) {
-		pcap_close(pcap);
+		close_rx_pcap(&pcap, &read_buffer);
 		return -1;
 	}
+	rx->queue[rx->num_of_queue - 1].read_buffer = read_buffer;
 
 	return 0;
 }
@@ -1304,6 +1359,7 @@ eth_from_pcaps_common(struct rte_vdev_device *vdev,
 		struct devargs_queue *queue = &rx_queues->queue[i];
 
 		pp->rx_pcap[i] = queue->pcap;
+		pp->rx_read_buffer[i] = queue->read_buffer;
 		strlcpy(rx->name, queue->name, sizeof(rx->name));
 		strlcpy(rx->type, queue->type, sizeof(rx->type));
 	}
@@ -1396,8 +1452,8 @@ eth_release_pcaps(struct pmd_devargs *pcaps,
 	}
 
 	for (i = 0; i < pcaps->num_of_queue; i++) {
-		if (pcaps->queue[i].pcap)
-			pcap_close(pcaps->queue[i].pcap);
+		close_rx_pcap(&pcaps->queue[i].pcap,
+				&pcaps->queue[i].read_buffer);
 	}
 }
 
@@ -1594,8 +1650,10 @@ create_eth:
 		eth_dev->device = &dev->device;
 
 		/* setup process private */
-		for (i = 0; i < pcaps.num_of_queue; i++)
+		for (i = 0; i < pcaps.num_of_queue; i++) {
 			pp->rx_pcap[i] = pcaps.queue[i].pcap;
+			pp->rx_read_buffer[i] = pcaps.queue[i].read_buffer;
+		}
 
 		for (i = 0; i < dumpers.num_of_queue; i++) {
 			pp->tx_dumper[i] = dumpers.queue[i].dumper;
