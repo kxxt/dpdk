@@ -8,6 +8,10 @@
 #include <stdio.h>
 #include <time.h>
 
+#ifdef __GLIBC__
+#include <stdio_ext.h>
+#endif
+
 #include <pcap.h>
 
 #include <rte_cycles.h>
@@ -625,6 +629,13 @@ open_single_rx_pcap(const char *pcap_filename, pcap_t **pcap,
 		free(buffer);
 		return -1;
 	}
+#ifdef __GLIBC__
+	/*
+	 * Each queue has a private stream and a single reader. Queue setup
+	 * and teardown must be serialized with packet processing.
+	 */
+	__fsetlocking(fp, FSETLOCKING_BYCALLER);
+#endif
 	*pcap = pcap_fopen_offline(fp, errbuf);
 	if (*pcap == NULL) {
 		PMD_LOG(ERR, "Couldn't open %s: %s", pcap_filename, errbuf);
